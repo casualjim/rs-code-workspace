@@ -150,10 +150,10 @@ jobs:
           git remote set-url origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
           git push origin HEAD
 
-      - name: Push release tag with RELEASE_TOKEN
+      - name: Push release tag
         env:
           TAG_NAME: v${{ steps.version.outputs.next_version }}
         run: |
           git config --unset-all http.https://github.com/.extraheader || true
-          git remote set-url origin "https://x-access-token:${{ secrets.RELEASE_TOKEN }}@github.com/${{ github.repository }}.git"
+          git remote set-url origin "https://x-access-token:${{ secrets.PUBLISH_TOKEN_GITHUB }}@github.com/${{ github.repository }}.git"
           git push origin "refs/tags/${TAG_NAME}"
