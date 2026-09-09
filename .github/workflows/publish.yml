@@ -1,0 +1,34 @@
+name: Publish
+
+on:
+  push:
+    tags:
+      - 'v[0-9]*'
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify tag matches crate version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          tag_version="${TAG#v}"
+          crate_version=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[0].version')
+          if [ "$tag_version" != "$crate_version" ]; then
+            echo "Tag $TAG does not match crate version $crate_version" >&2
+            exit 1
+          fi
+
+      - name: Publish to crates.io
+        run: cargo publish --locked
