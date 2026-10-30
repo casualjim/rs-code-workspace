@@ -17,6 +17,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - uses: cargo-bins/cargo-binstall@main
+
+      - name: Install jj
+        run: cargo binstall -y jj-cli
+
       - name: Format
         run: cargo fmt --all -- --check
 

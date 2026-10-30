@@ -3,7 +3,6 @@ use std::fs::{read_dir, read_to_string};
 use std::path::Path;
 
 use dotnet_lens::search;
-use relative_path::RelativePath;
 
 use crate::Result;
 use toml_edit::DocumentMut;
@@ -17,8 +16,11 @@ use crate::parsers::{
   strip_json_comments, toml_array_strings,
 };
 use crate::paths::WorkspacePath;
+use crate::scan::Scan;
 use crate::stack::stack_marker_ecosystem;
-use crate::types::{Ecosystem, WorkspaceConfig, WorkspaceDependency, WorkspacePackage};
+use crate::types::{
+  DiscoveryWarning, Ecosystem, WorkspaceConfig, WorkspaceDependency, WorkspacePackage,
+};
 
 pub(super) fn detect_ecosystem_configs(
   dir: &Path,
@@ -69,6 +71,42 @@ pub(super) fn detect_ecosystem_configs(
   }
 
   Ok(configs)
+}
+
+/// Detect every project found by `scan` and rebase its paths onto `workspace_root`.
+///
+/// A project whose detection fails is skipped and reported as a warning.
+pub(super) fn detect_nested_configs(
+  workspace_root: &Path,
+  scan: &Scan,
+) -> (Vec<WorkspaceConfig>, Vec<DiscoveryWarning>) {
+  let mut configs = Vec::new();
+  let mut warnings = Vec::new();
+  for prefix in scan.project_dirs() {
+    let dir = workspace_root.join(prefix);
+    match detect_project(&dir, prefix, &scan.files_below(prefix)) {
+      Ok(found) => configs.extend(found),
+      Err(err) => warnings.push(DiscoveryWarning::for_project(&dir, &err)),
+    }
+  }
+  (configs, warnings)
+}
+
+fn detect_project(dir: &Path, prefix: &Path, files: &[&Path]) -> Result<Vec<WorkspaceConfig>> {
+  let mut configs = detect_ecosystem_configs(dir, files)?;
+  for config in &mut configs {
+    for package in &mut config.packages {
+      package.path = rebase(prefix, &package.path)?;
+    }
+    for dependency in &mut config.dependencies {
+      dependency.manifest_path = rebase(prefix, &dependency.manifest_path)?;
+    }
+  }
+  Ok(configs)
+}
+
+fn rebase(prefix: &Path, path: &WorkspacePath) -> Result<WorkspacePath> {
+  WorkspacePath::from_relative_path(&prefix.join(path.as_str()))
 }
 
 fn dependency_records(
@@ -904,6 +942,10 @@ fn detect_dotnet_workspace(dir: &Path, files: &[&Path]) -> Result<Option<Workspa
   }))
 }
 
+/// Derive ecosystems and packages from known file names in the scanned file list.
+///
+/// A package is the directory holding the file. Callers drop a directory that
+/// already contains a package of the same ecosystem: that is a workspace root.
 pub(super) fn detect_workspace_packages_from_files(
   workspace_root: &Path,
   files: &[&Path],
@@ -924,8 +966,8 @@ pub(super) fn detect_workspace_packages_from_files(
 
     ecosystems.insert(ecosystem);
 
-    let dir_rel = RelativePath::from_path(file).unwrap_or(RelativePath::new(""));
-    let Ok(dir_path) = WorkspacePath::parse(dir_rel.as_str()) else {
+    let Ok(dir_path) = WorkspacePath::from_relative_path(file.parent().unwrap_or(Path::new("")))
+    else {
       continue;
     };
     if !seen.insert((ecosystem, dir_path.clone())) {
