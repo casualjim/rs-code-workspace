@@ -240,6 +240,7 @@ pub fn infer_ecosystem_from_stack(stack: &DetectedStack) -> Ecosystem {
   stack.infer_ecosystem()
 }
 
+/// Map a lowercase file name to the ecosystem it marks, if any.
 pub(super) fn stack_marker_ecosystem(file_name: &str) -> Option<Ecosystem> {
   if is_dotnet_file(file_name) {
     return Some(Ecosystem::DotNet);

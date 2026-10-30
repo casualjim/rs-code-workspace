@@ -86,6 +86,13 @@ pub enum Error {
     /// Path that could not be resolved.
     path: PathBuf,
   },
+
+  /// A `.git` file or Jujutsu repository pointer did not have the expected format.
+  #[error("invalid VCS pointer file: {path}")]
+  InvalidVcsPointer {
+    /// Pointer file that could not be parsed.
+    path: PathBuf,
+  },
 }
 
 impl Error {

@@ -14,20 +14,27 @@
 //! `path#L12` and `path:symbol` into a [`WorkspaceTarget`] plus typed
 //! [`WorkspaceTargetWarning`] values.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
+
+use crate::scan::Scan;
 
 /// Workspace-relative path helpers.
 pub mod paths;
 /// Stack detection and ecosystem inference helpers.
 pub mod stack;
 
+#[cfg(test)]
+mod discovery_tests;
+
 mod detector;
 mod error;
 mod packages;
 mod parsers;
 mod root;
+mod scan;
 mod types;
+mod vcs;
 
 pub use error::Error;
 
@@ -40,11 +47,12 @@ pub use stack::{
   stack_name_for_ecosystem,
 };
 pub use types::{
-  Ecosystem, WorkspaceConfig, WorkspaceDependency, WorkspaceKind, WorkspacePackage,
-  WorkspaceTarget, WorkspaceTargetWarning,
+  DiscoveryWarning, Ecosystem, WorkspaceConfig, WorkspaceDependency, WorkspaceKind,
+  WorkspacePackage, WorkspaceTarget, WorkspaceTargetWarning,
 };
+pub use vcs::Vcs;
 
-const DEPENDENCY_MANIFEST_NAMES: &[&str] = &[
+pub(crate) const DEPENDENCY_MANIFEST_NAMES: &[&str] = &[
   "cargo.toml",
   "package.json",
   "go.mod",
@@ -73,8 +81,12 @@ pub fn is_dependency_manifest_path(path: &str) -> bool {
 /// # Errors
 /// Returns an error when no workspace marker can be found while walking upward.
 pub fn resolve_root(explicit_root: Option<&Path>, start: &Path) -> Result<PathBuf> {
+  resolve(explicit_root, start).map(|(root, _)| root)
+}
+
+fn resolve(explicit_root: Option<&Path>, start: &Path) -> Result<(PathBuf, Vec<DiscoveryWarning>)> {
   if let Some(root) = explicit_root {
-    return Ok(root.to_path_buf());
+    return Ok((root.to_path_buf(), Vec::new()));
   }
 
   let start_dir = if start.is_dir() {
@@ -83,52 +95,62 @@ pub fn resolve_root(explicit_root: Option<&Path>, start: &Path) -> Result<PathBu
     start.parent().unwrap_or(start)
   };
 
-  let Some(root) = root::find_workspace_root(start_dir) else {
-    return Err(Error::NoWorkspaceMarker {
-      start: start_dir.display().to_string(),
-    });
-  };
-
-  Ok(root)
+  root::find_workspace_root(start_dir).ok_or_else(|| Error::NoWorkspaceMarker {
+    start: start_dir.display().to_string(),
+  })
 }
 
-fn detect(
-  workspace_root: &Path,
-  files: &[&Path],
-) -> Result<(
-  Vec<WorkspacePackage>,
-  BTreeSet<Ecosystem>,
-  Vec<WorkspaceDependency>,
-)> {
+struct Detected {
+  packages: Vec<WorkspacePackage>,
+  ecosystems: BTreeSet<Ecosystem>,
+  dependencies: Vec<WorkspaceDependency>,
+  warnings: Vec<DiscoveryWarning>,
+}
+
+fn detect(workspace_root: &Path, scan: &Scan) -> Result<Detected> {
+  let files = scan.files_below(Path::new(""));
   let mut ecosystems = BTreeSet::new();
   let mut packages = Vec::new();
   let mut dependencies = Vec::new();
-  let mut seen: std::collections::HashSet<(Ecosystem, WorkspacePath)> =
-    std::collections::HashSet::new();
+  let mut seen_packages: HashSet<(Ecosystem, WorkspacePath)> = HashSet::new();
+  let mut seen_dependencies: HashSet<(String, String, WorkspacePath, Ecosystem)> = HashSet::new();
 
-  for config in detector::detect_ecosystem_configs(workspace_root, files)? {
+  let root_configs = detector::detect_ecosystem_configs(workspace_root, &files)?;
+  let (nested_configs, warnings) = detector::detect_nested_configs(workspace_root, scan);
+  for config in root_configs.into_iter().chain(nested_configs) {
     ecosystems.insert(config.ecosystem);
-    dependencies.extend(config.dependencies);
-    for package in config.packages {
-      if !seen.insert((package.ecosystem, package.path.clone())) {
-        continue;
+    for dependency in config.dependencies {
+      let key = (
+        dependency.name.clone(),
+        dependency.group.clone(),
+        dependency.manifest_path.clone(),
+        dependency.ecosystem,
+      );
+      if seen_dependencies.insert(key) {
+        dependencies.push(dependency);
       }
-      packages.push(package);
+    }
+    for package in config.packages {
+      if seen_packages.insert((package.ecosystem, package.path.clone())) {
+        packages.push(package);
+      }
     }
   }
 
   let (detected_packages, detected_ecosystems) =
-    detector::detect_workspace_packages_from_files(workspace_root, files);
+    detector::detect_workspace_packages_from_files(workspace_root, &files);
   ecosystems.extend(detected_ecosystems);
   for package in detected_packages {
-    if !seen.insert((package.ecosystem, package.path.clone())) {
-      continue;
+    let encloses_same_ecosystem = packages.iter().any(|existing| {
+      existing.ecosystem == package.ecosystem && existing.path.starts_with(&package.path)
+    });
+    if !encloses_same_ecosystem && seen_packages.insert((package.ecosystem, package.path.clone())) {
+      packages.push(package);
     }
-    packages.push(package);
   }
 
   let mut stack = DetectedStack::new();
-  for file in files {
+  for file in &files {
     stack::detect_stack_from_path(file, &mut stack);
   }
   let ecosystem = stack::infer_ecosystem_from_stack(&stack);
@@ -137,7 +159,12 @@ fn detect(
     packages.push(packages::default_package(workspace_root, ecosystem));
   }
 
-  Ok((packages, ecosystems, dependencies))
+  Ok(Detected {
+    packages,
+    ecosystems,
+    dependencies,
+    warnings,
+  })
 }
 
 /// Resolved workspace information for a repository.
@@ -145,6 +172,9 @@ fn detect(
 pub struct Workspace {
   root: PathBuf,
   has_git: bool,
+  repository_root: Option<PathBuf>,
+  vcs: Option<Vcs>,
+  warnings: Vec<DiscoveryWarning>,
   packages: Vec<WorkspacePackage>,
   dependencies: Vec<WorkspaceDependency>,
   ecosystems: BTreeSet<Ecosystem>,
@@ -161,14 +191,17 @@ impl Workspace {
   /// # Errors
   /// Returns an error when workspace root discovery fails.
   pub fn new(explicit_root: Option<&Path>, start: &Path) -> Result<Self> {
-    let root = resolve_root(explicit_root, start)?;
+    let (root, mut warnings) = resolve(explicit_root, start)?;
+    let vcs = Vcs::detect(&root);
     let has_git = root.join(".git").exists();
+    let repository_root = vcs.map(|vcs| vcs.repository_root(&root)).transpose()?;
 
-    let (packages, ecosystems, dependencies) = detect(&root, &[])?;
-    let package_count = packages.len();
-    let ecosystem_count = ecosystems.len();
-    let is_mono = package_count > 1;
-    let is_poly = ecosystem_count > 1;
+    let scan = Scan::run(&root);
+    let detected = detect(&root, &scan)?;
+    warnings.extend(scan.warnings);
+    warnings.extend(detected.warnings);
+    let is_mono = detected.packages.len() > 1;
+    let is_poly = detected.ecosystems.len() > 1;
     let kind = match (is_mono, is_poly) {
       (false, false) => WorkspaceKind::SingleLanguageRepo,
       (true, false) => WorkspaceKind::Monorepo,
@@ -179,10 +212,13 @@ impl Workspace {
     Ok(Self {
       root,
       has_git,
-      packages,
-      dependencies,
-      ecosystems,
+      repository_root,
+      vcs,
+      packages: detected.packages,
+      dependencies: detected.dependencies,
+      ecosystems: detected.ecosystems,
       kind,
+      warnings,
     })
   }
 
@@ -212,6 +248,30 @@ impl Workspace {
   #[must_use]
   pub fn has_git(&self) -> bool {
     self.has_git
+  }
+
+  /// Return the canonical root of the main repository that owns this checkout.
+  ///
+  /// A linked git worktree or secondary jj workspace resolves to its main
+  /// repository; a plain checkout resolves to its own canonical root. `None`
+  /// when the workspace has no VCS marker.
+  #[must_use]
+  pub fn repository_root(&self) -> Option<&Path> {
+    self.repository_root.as_deref()
+  }
+
+  /// Return the version control system that owns this checkout, if any.
+  ///
+  /// Colocated Jujutsu checkouts report [`Vcs::JujutsuColocated`].
+  #[must_use]
+  pub fn vcs(&self) -> Option<Vcs> {
+    self.vcs
+  }
+
+  /// Return the non-fatal problems met during discovery; each names a skipped path.
+  #[must_use]
+  pub fn warnings(&self) -> &[DiscoveryWarning] {
+    &self.warnings
   }
 
   /// Return the discovered workspace packages.
@@ -437,6 +497,9 @@ mod tests {
     Workspace {
       root: root.to_path_buf(),
       has_git: root.join(".git").exists(),
+      repository_root: None,
+      vcs: None,
+      warnings: Vec::new(),
       packages,
       dependencies: Vec::new(),
       ecosystems: BTreeSet::new(),

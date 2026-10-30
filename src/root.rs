@@ -1,7 +1,7 @@
 //! Workspace-root discovery markers used by [`crate::Workspace::discover`].
 //!
 //! Discovery walks upward until it finds one of the supported markers below:
-//! - `.git`
+//! - `.git` or `.jj` (a VCS marker beats every marker below)
 //! - `Cargo.toml` with a `[workspace]` table
 //! - `package.json` with a `workspaces` field, or `pnpm-workspace.yaml`
 //! - `go.work`
@@ -19,13 +19,18 @@
 //! umbrella apps. These heuristics are intentionally simple and only answer
 //! whether a directory should be treated as a workspace root.
 
+use std::ffi::OsStr;
 use std::fs::{read_dir, read_to_string};
 use std::path::{Path, PathBuf};
 
 use toml_edit::DocumentMut;
 
+use crate::detector::detect_ecosystem_configs;
 use crate::parsers::{parse_elixir_apps_path, strip_json_comments};
-
+use crate::paths::WorkspacePath;
+use crate::types::DiscoveryWarning;
+use crate::vcs::Vcs;
+use crate::{DEPENDENCY_MANIFEST_NAMES, Error, Result};
 const SIMPLE_MARKERS: &[&str] = &[
   "pnpm-workspace.yaml",
   "melos.yaml",
@@ -41,21 +46,85 @@ const SIMPLE_MARKERS: &[&str] = &[
 ];
 const BAZEL_MARKERS: &[&str] = &["WORKSPACE", "WORKSPACE.bazel", "MODULE.bazel"];
 
-pub(super) fn find_workspace_root(start: &Path) -> Option<PathBuf> {
-  let mut current = start.to_path_buf();
-  loop {
-    if has_workspace_marker(&current) {
-      return Some(current);
-    }
-    if !current.pop() {
-      return None;
-    }
-  }
+/// Lowercase file names, beyond [`SIMPLE_MARKERS`] and the dependency manifests, that mark a project.
+const PROJECT_FILES: &[&str] = &[
+  "pyproject.toml",
+  "pubspec.yaml",
+  "mix.exs",
+  "workspace",
+  "workspace.bazel",
+  "module.bazel",
+  "deno.json",
+  "deno.jsonc",
+];
+const PROJECT_EXTENSIONS: &[&str] = &["sln", "slnx", "csproj", "fsproj", "vbproj", "gemspec"];
+
+/// Return true when a lowercase file name marks its directory as a project or workspace.
+pub(super) fn is_project_file(lower_name: &str) -> bool {
+  DEPENDENCY_MANIFEST_NAMES.contains(&lower_name)
+    || SIMPLE_MARKERS.contains(&lower_name)
+    || PROJECT_FILES.contains(&lower_name)
+    || Path::new(lower_name)
+      .extension()
+      .and_then(OsStr::to_str)
+      .is_some_and(|ext| PROJECT_EXTENSIONS.contains(&ext))
 }
 
-pub(super) fn has_workspace_marker(dir: &Path) -> bool {
-  has_git_marker(dir)
-    || has_cargo_workspace(dir)
+/// Resolve the workspace root and the problems met while doing so.
+///
+/// The nearest VCS marker wins. Without one, the nearest language workspace
+/// marker is the candidate, and discovery climbs to every enclosing marker
+/// whose workspace members include it. With no workspace marker at all, the
+/// nearest directory holding a project file is the root.
+pub(super) fn find_workspace_root(start: &Path) -> Option<(PathBuf, Vec<DiscoveryWarning>)> {
+  if let Some(dir) = start.ancestors().find(|dir| Vcs::detect(dir).is_some()) {
+    return Some((dir.to_path_buf(), Vec::new()));
+  }
+
+  let mut warnings = Vec::new();
+  let mut markers = start.ancestors().filter(|dir| has_ecosystem_marker(dir));
+  let Some(mut root) = markers.next() else {
+    return start
+      .ancestors()
+      .find(|dir| has_project_file(dir))
+      .map(|dir| (dir.to_path_buf(), warnings));
+  };
+  for outer in markers {
+    match lists_member(outer, root) {
+      Ok(true) => root = outer,
+      Ok(false) => {}
+      Err(err) => warnings.push(DiscoveryWarning::for_project(outer, &err)),
+    }
+  }
+  Some((root.to_path_buf(), warnings))
+}
+
+fn lists_member(outer: &Path, inner: &Path) -> Result<bool> {
+  let relative = inner
+    .strip_prefix(outer)
+    .map_err(|_| Error::PathOutsideWorkspace)?;
+  let relative = WorkspacePath::from_relative_path(relative)?;
+  Ok(
+    detect_ecosystem_configs(outer, &[])?
+      .iter()
+      .flat_map(|config| &config.packages)
+      .any(|package| package.path == relative),
+  )
+}
+
+fn has_project_file(dir: &Path) -> bool {
+  read_dir(dir).is_ok_and(|entries| {
+    entries.flatten().any(|entry| {
+      entry
+        .file_name()
+        .to_str()
+        .is_some_and(|name| is_project_file(&name.to_ascii_lowercase()))
+    })
+  })
+}
+
+fn has_ecosystem_marker(dir: &Path) -> bool {
+  has_cargo_workspace(dir)
     || has_simple_marker(dir)
     || has_maven_modules(dir)
     || has_package_json_workspaces(dir)
@@ -65,10 +134,6 @@ pub(super) fn has_workspace_marker(dir: &Path) -> bool {
     || has_mix_workspace(dir)
     || has_bazel_workspace(dir)
     || has_dotnet_workspace(dir)
-}
-
-fn has_git_marker(dir: &Path) -> bool {
-  dir.join(".git").exists()
 }
 
 fn has_cargo_workspace(dir: &Path) -> bool {

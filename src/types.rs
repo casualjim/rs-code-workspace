@@ -1,4 +1,6 @@
 use std::fmt;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use crate::Error;
@@ -328,6 +330,49 @@ impl fmt::Display for WorkspaceTargetWarning {
       Self::OutsideWorkspace => f.write_str("path outside workspace"),
       Self::InvalidLineAnchor => f.write_str("invalid line anchor"),
       Self::UnsupportedAnchor => f.write_str("unsupported anchor"),
+    }
+  }
+}
+
+/// Non-fatal problem met during workspace discovery. The affected path was skipped.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DiscoveryWarning {
+  /// A path could not be read during the workspace scan.
+  UnreadablePath {
+    /// Path that could not be read.
+    path: PathBuf,
+    /// Kind of the underlying I/O failure.
+    kind: io::ErrorKind,
+  },
+  /// A project directory held a manifest that could not be parsed. Its package and ecosystem
+  /// still come from the file name, but it contributed no dependencies or workspace members.
+  InvalidProject {
+    /// Project directory whose manifest failed to parse.
+    path: PathBuf,
+  },
+  /// A symlink cycle was found and not followed.
+  FilesystemLoop {
+    /// Path that closes the cycle.
+    path: PathBuf,
+  },
+  /// An ignore file held a rule that could not be parsed.
+  InvalidIgnoreRule {
+    /// Path involved in the failing ignore rule.
+    path: PathBuf,
+  },
+}
+
+impl DiscoveryWarning {
+  /// Classify a detection failure in the project at `dir`.
+  pub(crate) fn for_project(dir: &Path, error: &Error) -> Self {
+    match error {
+      Error::Io(err) => Self::UnreadablePath {
+        path: dir.to_path_buf(),
+        kind: err.kind(),
+      },
+      _ => Self::InvalidProject {
+        path: dir.to_path_buf(),
+      },
     }
   }
 }
